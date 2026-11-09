@@ -53,7 +53,7 @@ from pathlib import Path
 # ==============================================================================
 # CONFIGURATION - à adapter une seule fois
 # ==============================================================================
-G5K_LOGIN = "smbengue@access.grid5000.fr"
+G5K_LOGIN = "smbengue"
 G5K_SITE = "nancy"
 # Alias de votre ~/.ssh/config (ex. "nancy.g5k") ; None = connexion directe via
 # access.grid5000.fr avec G5K_LOGIN / G5K_SITE. "local" = mode essai sans Grid'5000.
