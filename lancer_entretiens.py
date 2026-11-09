@@ -53,7 +53,7 @@ from pathlib import Path
 # ==============================================================================
 # CONFIGURATION - à adapter une seule fois
 # ==============================================================================
-G5K_LOGIN = "votre_login_g5k"
+G5K_LOGIN = "smbengue@access.grid5000.fr"
 G5K_SITE = "nancy"
 # Alias de votre ~/.ssh/config (ex. "nancy.g5k") ; None = connexion directe via
 # access.grid5000.fr avec G5K_LOGIN / G5K_SITE. "local" = mode essai sans Grid'5000.
@@ -66,15 +66,25 @@ DOSSIER_LOTS_DISTANT = "~/pipelines"              # sur Grid'5000 : un sous-doss
 # Dépôts GitHub : (nom du dossier de clonage, URL, branche / tag / commit).
 # Les noms doivent correspondre aux {pipelines}/<nom>/... de config.ini.
 DEPOTS = [
-    ("orchestration",     "https://github.com/VOTRE_COMPTE/pipelines-entretiens.git", "main"),
-    ("eye-tracker-utils", "https://github.com/VOTRE_COMPTE/eye-tracker-utils.git",    "main"),
-    ("synchronisation",   "https://github.com/VOTRE_COMPTE/synchronisation.git",      "main"),
-    ("mesures_manquantes", "https://github.com/VOTRE_COMPTE/mesures_manquantes.git",  "main"),
-    ("transcription",     "https://github.com/VOTRE_COMPTE/transcription.git",        "main"),
-    ("analyse",           "https://github.com/VOTRE_COMPTE/analyse.git",              "main"),
+    ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"),
+    ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"),
+    ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"),
+    ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"),
+    ("transcription",     "git@github.com:P282446/Transcription.git",        "main"),
+    ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"),
 ]
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
-FICHIER_ORCHESTRATEUR = "orchestrateur.py"
+FICHIER_ORCHESTRATEUR = "orchestrateur.py"smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+smbengue@access.grid5000.fr
+
 FICHIER_CONFIG = "config.ini"
 
 INTERVALLE_ATTENTE_MIN = 10   # --attendre : fréquence de vérification
