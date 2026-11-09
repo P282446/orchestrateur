@@ -74,17 +74,7 @@ DEPOTS = [
     ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"),
 ]
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
-FICHIER_ORCHESTRATEUR = "orchestrateur.py"smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-smbengue@access.grid5000.fr
-
+FICHIER_ORCHESTRATEUR = "orchestrateur.py"
 FICHIER_CONFIG = "config.ini"
 
 INTERVALLE_ATTENTE_MIN = 10   # --attendre : fréquence de vérification
