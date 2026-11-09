@@ -87,6 +87,12 @@ class Config:
         self.python = g.get("python", "python3").strip()
         self.scripts = Path(os.path.expanduser(g.get("scripts", "").strip()
                                                or Path(__file__).parent)).resolve()
+        # Dossier contenant les dépôts de pipelines clonés côte à côte (un "lot").
+        # Par défaut : le dossier parent du dépôt de l'orchestrateur (orchestrateur.py doit
+        # donc se trouver à la racine de son dépôt) ; modifiable avec "pipelines = ..."
+        pip = g.get("pipelines", "").strip()
+        self.pipelines = (Path(os.path.expanduser(pip)).resolve() if pip
+                          else Path(__file__).resolve().parents[1])
         self.video_transcription = g.get("video_transcription", "sujet").strip()
         if self.video_transcription not in REGARDEURS:
             sys.exit(f"video_transcription doit valoir l'une de {REGARDEURS}")
@@ -151,10 +157,11 @@ class Contexte:
         self.base = {
             "entretien": entrees["entretien"], "racine": racine,
             "resultats": racine / "resultats", "scripts": cfg.scripts,
-            "python": cfg.python,
+            "python": cfg.python, "pipelines": cfg.pipelines,
             "video_transcription": entrees[f"video_{cfg.video_transcription}"],
         }
         self.base.update({k: entrees[k] for k in CLES_ENTREES})
+        self.base.update(entrees.get("extra", {}))   # entrées facultatives (colonnes en plus du manifeste)
         portee = cfg.etapes[etape]["portee"]
         if portee == "regardeur":
             self.base.update({"regardeur": reg, "video": entrees[f"video_{reg}"],
@@ -276,6 +283,23 @@ def lancer_unite(cfg, racine, entrees, etape, reg):
     return code, journal
 
 
+def noter_versions(cfg, racine):
+    """Écrit resultats/versions_pipelines.txt : commit Git de chaque dépôt du lot."""
+    lignes = []
+    if cfg.pipelines.is_dir():
+        for d in sorted(cfg.pipelines.iterdir()):
+            if (d / ".git").exists():
+                try:
+                    r = subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"],
+                                       capture_output=True, text=True)
+                    lignes.append(f"{d.name}\t{r.stdout.strip() or '?'}")
+                except OSError:
+                    lignes.append(f"{d.name}\t?")
+    (racine / "resultats").mkdir(exist_ok=True)
+    (racine / "resultats" / "versions_pipelines.txt").write_text(
+        "\n".join(lignes) + "\n", encoding="utf-8")
+
+
 def executer(cfg, entretien):
     racine = cfg.dossier(entretien)
     etat = charger_etat(racine)
@@ -295,7 +319,7 @@ def executer(cfg, entretien):
     if os.environ.get("OAR_JOB_ID"):
         etat["job_en_cours"] = os.environ["OAR_JOB_ID"]
     sauver_etat(racine, etat)
-    (racine / "resultats").mkdir(exist_ok=True)
+    noter_versions(cfg, racine)
     log(f"Entretien {entretien} : démarrage (tentative {etat['tentatives']})")
 
     manquants = [k for k in CLES_ENTREES if not Path(entrees[k]).exists()]
@@ -430,6 +454,13 @@ def chemin_abs(valeur, base):
     return str((p if p.is_absolute() else base / p).resolve())
 
 
+def valeur_extra(valeur, base):
+    """Entrée facultative : chemin absolu si le fichier existe, sinon texte tel quel."""
+    p = Path(valeur).expanduser()
+    p = p if p.is_absolute() else base / p
+    return str(p.resolve()) if p.exists() else valeur
+
+
 def lire_manifeste(chemin):
     base = Path(chemin).resolve().parent
     with open(chemin, encoding="utf-8-sig", newline="") as f:
@@ -449,6 +480,10 @@ def lire_manifeste(chemin):
                      f"(attendu : {colonnes})")
         e = {"entretien": l["entretien"]}
         e.update({k: chemin_abs(l[k], base) for k in CLES_ENTREES})
+        extra = {k: valeur_extra(v, base) for k, v in l.items()
+                 if k and k not in colonnes and v}
+        if extra:
+            e["extra"] = extra
         resultat.append(e)
     return resultat
 
@@ -461,6 +496,12 @@ def entrees_depuis_args(a):
                  "--fix-sujet --fix-psy")
     e = {"entretien": a.entretien}
     e.update({k: chemin_abs(v, Path.cwd()) for k, v in vals.items()})
+    extra = {}
+    for item in a.extra:
+        nom, _, val = item.partition("=")
+        extra[nom.strip()] = valeur_extra(val.strip(), Path.cwd())
+    if extra:
+        e["extra"] = extra
     return [e]
 
 
@@ -475,8 +516,22 @@ def verifier_entrees(liste):
 # ------------------------------------------------------------------------------
 # Statut
 # ------------------------------------------------------------------------------
-def afficher_statut(cfg):
+def afficher_statut(cfg, en_json=False):
     total = len(liste_unites(cfg))
+    if en_json:
+        sortie = []
+        for p in sorted(cfg.racine_travail.glob("*/etat.json")):
+            e = json.loads(p.read_text(encoding="utf-8"))
+            sortie.append({
+                "entretien": e["entretien"], "statut": e["statut"],
+                "unites_terminees": sum(1 for u in e["unites"].values()
+                                        if u.get("statut") == "termine"),
+                "unites_total": total, "tentatives": e["tentatives"],
+                "job_ids": e["job_ids"], "maj": e.get("maj", ""),
+                "erreur": e.get("erreur", ""), "racine": str(p.parent),
+                "resultats": str(p.parent / "resultats")})
+        print(json.dumps(sortie, ensure_ascii=False))
+        return
     lignes = []
     for p in sorted(cfg.racine_travail.glob("*/etat.json")):
         e = json.loads(p.read_text(encoding="utf-8"))
@@ -511,6 +566,8 @@ def main():
     s.add_argument("--video-psy")
     s.add_argument("--fix-sujet")
     s.add_argument("--fix-psy")
+    s.add_argument("--extra", action="append", default=[], metavar="NOM=VALEUR",
+                   help="Entrée facultative utilisable comme {nom} dans les commandes")
     s.add_argument("--apres", help="Démarrer après ce job OAR")
     s.add_argument("--simuler", action="store_true", help="Afficher les oarsub sans les lancer")
     s.add_argument("--local", action="store_true", help="Exécuter sans OAR, un entretien après l'autre")
@@ -522,6 +579,7 @@ def main():
 
     s = sp.add_parser("statut", help="Afficher l'avancement")
     commun(s)
+    s.add_argument("--json", action="store_true", help="Sortie lisible par un programme")
 
     s = sp.add_parser("relancer", help="Resoumettre les entretiens incomplets")
     commun(s)
@@ -536,7 +594,7 @@ def main():
     if a.cmd == "executer":
         sys.exit(executer(cfg, a.entretien))
     if a.cmd == "statut":
-        afficher_statut(cfg)
+        afficher_statut(cfg, en_json=a.json)
         return
     if a.cmd == "soumettre":
         liste = lire_manifeste(a.manifeste) if a.manifeste else entrees_depuis_args(a)
