@@ -33,6 +33,7 @@ Dépendances : bibliothèque standard uniquement.
 """
 
 import argparse
+import ast
 import configparser
 import csv
 import json
@@ -125,6 +126,7 @@ class Config:
             env = {"type": type_env,
                    "requirements": s.get("requirements", "").strip().replace("{pipelines}", str(self.pipelines)),
                    "paquets": s.get("paquets", "").strip(),
+                   "sources": s.get("sources", "").strip().replace("{pipelines}", str(self.pipelines)),
                    "version_python": s.get("version_python", "").strip(),
                    "python_exe": s.get("python_exe", self.python).strip()}
             self.etapes[e] = {"commandes": cmds, "portee": portee,
@@ -297,11 +299,84 @@ def env_pret(cfg, etape):
             or (dossier_env(cfg, etape) / ENV_PRET).exists())
 
 
+# Nom du package PyPI quand il diffère du nom du module importé
+MODULE_VERS_PAQUET = {
+    "cv2": "opencv-python", "PIL": "Pillow", "sklearn": "scikit-learn", "skimage": "scikit-image",
+    "yaml": "PyYAML", "bs4": "beautifulsoup4", "dateutil": "python-dateutil",
+    "pyannote": "pyannote.audio", "whisper": "openai-whisper", "fitz": "PyMuPDF",
+    "serial": "pyserial", "docx": "python-docx", "jwt": "PyJWT", "attr": "attrs",
+    "git": "GitPython", "zmq": "pyzmq", "Bio": "biopython", "magic": "python-magic",
+    "OpenSSL": "pyOpenSSL", "faiss": "faiss-cpu", "dotenv": "python-dotenv",
+    "psycopg2": "psycopg2-binary", "umap": "umap-learn", "tables": "tables",
+}
+DOSSIERS_IGNORES = {".git", ".envs", "__pycache__", "venv", ".venv", "env", "site-packages", "node_modules"}
+
+
+def detecter_paquets(dossiers):
+    """Packages PyPI nécessaires, déduits des import des fichiers .py (hors bibliothèque
+    standard et modules du dépôt lui-même). Retourne (paquets, modules_locaux_ignores)."""
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        raise ValueError("la détection automatique des packages demande Python 3.10 ou plus")
+    importes, locaux = set(), set()
+    for dossier in dossiers:
+        base = Path(dossier)
+        if not base.is_dir():
+            raise ValueError(f"dossier 'sources' introuvable : {dossier}")
+        for p in base.rglob("*.py"):
+            if DOSSIERS_IGNORES & set(p.relative_to(base).parts):
+                continue
+            locaux.add(p.stem)
+            if p.name == "__init__.py":
+                locaux.add(p.parent.name)
+            try:
+                arbre = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError:
+                continue
+            for n in ast.walk(arbre):
+                if isinstance(n, ast.Import):
+                    importes.update(a.name.split(".")[0] for a in n.names)
+                elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                    importes.add(n.module.split(".")[0])
+    externes = {m for m in importes if m not in stdlib and m not in locaux and m != "__future__"}
+    return sorted({MODULE_VERS_PAQUET.get(m, m) for m in externes}, key=str.lower), sorted(importes & locaux)
+
+
+def _nom_paquet(spec):
+    m = re.match(r"[A-Za-z0-9_.\-]+", spec)
+    return re.sub(r"[-_.]+", "-", m.group(0)).lower() if m else spec.lower()
+
+
+def paquets_a_installer(e):
+    """Liste finale : 'auto' est remplacé par les packages détectés ; une entrée explicite
+    (ex. opencv-python<5) l'emporte sur la détection du même package."""
+    jetons = shlex.split(e["paquets"])
+    if "auto" not in jetons:
+        return jetons
+    if not e["sources"]:
+        raise ValueError("paquets = auto demande aussi sources = <dossier à analyser>")
+    detectes, _ = detecter_paquets(shlex.split(e["sources"]))
+    explicites = [j for j in jetons if j != "auto"]
+    noms = {_nom_paquet(j) for j in explicites}
+    return explicites + [d for d in detectes if _nom_paquet(d) not in noms]
+
+
 def script_creation_env(cfg, etape):
     e = cfg.etapes[etape]["env"]
     l = ["set -euo pipefail", "env=" + shlex.quote(str(dossier_env(cfg, etape))),
-         f'if [ -f "$env/{ENV_PRET}" ]; then exit 0; fi',
-         'rm -rf "$env"', 'mkdir -p "$(dirname "$env")"']
+         f'if [ -f "$env/{ENV_PRET}" ]; then exit 0; fi']
+    if e["requirements"]:
+        # Vérification AVANT de créer l'environnement (échec rapide) ; en cas d'absence,
+        # on liste les fichiers requirements*.txt réellement présents dans le dépôt.
+        req = shlex.quote(e["requirements"])
+        try:
+            depot = cfg.pipelines / Path(e["requirements"]).relative_to(cfg.pipelines).parts[0]
+        except ValueError:
+            depot = Path(e["requirements"]).parent
+        l.append(f'if [ ! -f {req} ]; then echo "ERREUR : fichier requirements introuvable :" {req} >&2; '
+                 f'echo "Fichiers requirements trouvés dans le dépôt :" >&2; '
+                 f"find {shlex.quote(str(depot))} -maxdepth 4 -name 'requirements*.txt' >&2; exit 1; fi")
+    l += ['rm -rf "$env"', 'mkdir -p "$(dirname "$env")"']
     if e["type"] == "venv":
         l += [shlex.quote(e["python_exe"]) + ' -m venv "$env"',
               'set +u; source "$env/bin/activate"; set -u']
@@ -314,11 +389,12 @@ def script_creation_env(cfg, etape):
               'conda activate "$env"; set -u']
     l.append('echo "python : $(command -v python) ($(python --version 2>&1))"')
     if e["requirements"]:
-        req = shlex.quote(e["requirements"])
-        l.append(f'test -f {req} || {{ echo "ERREUR : requirements introuvable :" {req} >&2; exit 1; }}')
-        l.append("python -m pip install -r " + req)
+        l.append("python -m pip install -r " + shlex.quote(e["requirements"]))
     if e["paquets"]:
-        l.append("python -m pip install " + " ".join(shlex.quote(x) for x in shlex.split(e["paquets"])))
+        liste = paquets_a_installer(e)
+        l.append('echo "packages à installer : ' + " ".join(liste).replace('"', "") + '"')
+        if liste:
+            l.append("python -m pip install " + " ".join(shlex.quote(x) for x in liste))
     l += [f'touch "$env/{ENV_PRET}"', 'echo "environnement prêt : $env"']
     return "\n".join(l) + "\n"
 
@@ -353,15 +429,42 @@ def assurer_env(cfg, etape, journal):
         return 0
     Path(journal).parent.mkdir(parents=True, exist_ok=True)
     t = cfg.etapes[etape]["env"]["type"]
-    return lancer_bash(script_creation_env(cfg, etape), cfg.pipelines, journal,
+    try:
+        script = script_creation_env(cfg, etape)
+    except ValueError as exc:
+        with open(journal, "ab") as f:
+            f.write(f"ERREUR : {exc}\n".encode())
+        return 1
+    return lancer_bash(script, cfg.pipelines, journal,
                        f"création de l'environnement {t} : {etape}")
+
+
+# Fonction shell disponible dans toutes les commandes : trouver <dossier> <nom_de_fichier>
+# affiche le chemin du fichier (le moins profond s'il y en a plusieurs) dans le dépôt, quelle
+# que soit son arborescence interne. À utiliser avec une affectation, pour que l'étape
+# s'arrête si le fichier est absent :   app=$(trouver {pipelines}/segmentation app.py)
+AIDE_SHELL = r"""trouver() {
+  if [ ! -d "$1" ]; then
+    echo "ERREUR : dossier introuvable : $1 (le nom du depot dans lanceur.ini correspond-il a config.ini ?)" >&2
+    return 1
+  fi
+  local f
+  f=$(find "$1" -maxdepth 6 -name "$2" -not -path '*/.git/*' -not -path '*/.envs/*' -printf '%d %p\n' | sort -n | sed -n 1p | cut -d' ' -f2-)
+  if [ -z "$f" ]; then
+    echo "ERREUR : '$2' introuvable dans $1. Contenu du depot :" >&2
+    find "$1" -maxdepth 3 -not -path '*/.git*' -not -path '*/.envs*' >&2
+    return 1
+  fi
+  echo "$f"
+}
+"""
 
 
 def lancer_unite(cfg, racine, entrees, etape, reg):
     """Lance les commandes d'une unité ; retourne le code de retour."""
     ctx = Contexte(cfg, racine, entrees, etape, reg)
     commandes = [c.format_map(ctx) for c in cfg.etapes[etape]["commandes"]]
-    script = "set -euo pipefail\n"
+    script = "set -euo pipefail\n" + AIDE_SHELL
     if cfg.preparation:
         script += cfg.preparation + "\n"
     activation = snippet_activation(cfg, etape)
@@ -693,6 +796,9 @@ def main():
     commun(s)
     s.add_argument("--entretien", required=True)
 
+    s = sp.add_parser("dependances", help="Afficher les packages détectés dans des dossiers de scripts")
+    s.add_argument("dossiers", nargs="+")
+
     s = sp.add_parser("statut", help="Afficher l'avancement")
     commun(s)
     s.add_argument("--json", action="store_true", help="Sortie lisible par un programme")
@@ -705,6 +811,15 @@ def main():
     s.add_argument("--local", action="store_true")
 
     a = p.parse_args()
+    if a.cmd == "dependances":
+        try:
+            paquets, locaux = detecter_paquets(a.dossiers)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        print("Packages à installer (déduits des import) :")
+        print("\n".join("  " + x for x in paquets) or "  (aucun)")
+        print(f"Modules du dépôt ignorés : {', '.join(locaux) or '-'}")
+        return
     cfg = Config(a.config)
 
     if a.cmd == "executer":
