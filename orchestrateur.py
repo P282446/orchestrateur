@@ -93,6 +93,11 @@ class Config:
         pip = g.get("pipelines", "").strip()
         self.pipelines = (Path(os.path.expanduser(pip)).resolve() if pip
                           else Path(__file__).resolve().parents[1])
+        # Où créer les environnements : "noeud" (dans le job, avant la 1re utilisation) ou
+        # "frontend" (au moment de 'soumettre', si les noeuds n'ont pas accès à Internet)
+        self.installation = g.get("installation_environnements", "noeud").strip()
+        if self.installation not in ("noeud", "frontend"):
+            sys.exit("installation_environnements doit valoir 'noeud' ou 'frontend'")
         self.video_transcription = g.get("video_transcription", "sujet").strip()
         if self.video_transcription not in REGARDEURS:
             sys.exit(f"video_transcription doit valoir l'une de {REGARDEURS}")
@@ -114,8 +119,16 @@ class Config:
             portee = s.get("portee", "entretien").strip()
             if portee not in ("regardeur", "entretien"):
                 sys.exit(f"[{e}] : portee doit valoir 'regardeur' ou 'entretien'")
+            type_env = s.get("environnement", "aucun").strip()
+            if type_env not in ("venv", "conda", "aucun"):
+                sys.exit(f"[{e}] : environnement doit valoir 'venv', 'conda' ou 'aucun'")
+            env = {"type": type_env,
+                   "requirements": s.get("requirements", "").strip().replace("{pipelines}", str(self.pipelines)),
+                   "paquets": s.get("paquets", "").strip(),
+                   "version_python": s.get("version_python", "").strip(),
+                   "python_exe": s.get("python_exe", self.python).strip()}
             self.etapes[e] = {"commandes": cmds, "portee": portee,
-                              "sortie": s.get("sortie", "").strip()}
+                              "sortie": s.get("sortie", "").strip(), "env": env}
 
     def dossier(self, entretien):
         return self.racine_travail / nettoyer_nom(entretien)
@@ -259,6 +272,91 @@ def _gestionnaire(signum, frame):
             pass
 
 
+# ------------------------------------------------------------------------------
+# Environnements : un par pipeline (venv ou conda), créés avant la première exécution
+# dans le lot ({pipelines}/.envs/<étape>) puis réutilisés par tous les entretiens du lot
+# ------------------------------------------------------------------------------
+ENV_PRET = ".pret"
+
+CONDA_TROUVER = r"""conda=$(command -v conda || true)
+for c in "$HOME/miniforge3/bin/conda" "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda"; do
+  if [ -z "$conda" ] && [ -x "$c" ]; then conda="$c"; fi
+done
+if [ -z "$conda" ]; then
+  echo "ERREUR : conda introuvable (installez Miniforge dans votre home Grid'5000)." >&2
+  exit 1
+fi"""
+
+
+def dossier_env(cfg, etape):
+    return cfg.pipelines / ".envs" / etape
+
+
+def env_pret(cfg, etape):
+    return (cfg.etapes[etape]["env"]["type"] == "aucun"
+            or (dossier_env(cfg, etape) / ENV_PRET).exists())
+
+
+def script_creation_env(cfg, etape):
+    e = cfg.etapes[etape]["env"]
+    l = ["set -euo pipefail", "env=" + shlex.quote(str(dossier_env(cfg, etape))),
+         f'if [ -f "$env/{ENV_PRET}" ]; then exit 0; fi',
+         'rm -rf "$env"', 'mkdir -p "$(dirname "$env")"']
+    if e["type"] == "venv":
+        l += [shlex.quote(e["python_exe"]) + ' -m venv "$env"',
+              'set +u; source "$env/bin/activate"; set -u']
+    else:
+        version = "python=" + e["version_python"] if e["version_python"] else "python"
+        l += [CONDA_TROUVER,
+              '"$conda" create -y -q -p "$env" ' + shlex.quote(version),
+              'echo "$conda" > "$env/.conda"',
+              'set +u; source "$("$conda" info --base)/etc/profile.d/conda.sh"; '
+              'conda activate "$env"; set -u']
+    l.append('echo "python : $(command -v python) ($(python --version 2>&1))"')
+    if e["requirements"]:
+        req = shlex.quote(e["requirements"])
+        l.append(f'test -f {req} || {{ echo "ERREUR : requirements introuvable :" {req} >&2; exit 1; }}')
+        l.append("python -m pip install -r " + req)
+    if e["paquets"]:
+        l.append("python -m pip install " + " ".join(shlex.quote(x) for x in shlex.split(e["paquets"])))
+    l += [f'touch "$env/{ENV_PRET}"', 'echo "environnement prêt : $env"']
+    return "\n".join(l) + "\n"
+
+
+def snippet_activation(cfg, etape):
+    t = cfg.etapes[etape]["env"]["type"]
+    env = shlex.quote(str(dossier_env(cfg, etape)))
+    if t == "venv":
+        return f"set +u; source {env}/bin/activate; set -u"
+    if t == "conda":
+        return (f'set +u; source "$("$(cat {env}/.conda)" info --base)/etc/profile.d/conda.sh"; '
+                f"conda activate {env}; set -u")
+    return ""
+
+
+def lancer_bash(script, cwd, journal, titre):
+    """Exécute un script bash en journalisant sa sortie ; retourne le code de retour."""
+    with open(journal, "ab") as f:
+        f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} : {titre} =====\n".encode())
+        f.flush()
+        proc = subprocess.Popen(["bash", "-c", script], cwd=cwd, stdout=f,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        _ARRET["proc"] = proc
+        code = proc.wait()
+        _ARRET["proc"] = None
+    return code
+
+
+def assurer_env(cfg, etape, journal):
+    """Crée l'environnement de l'étape s'il n'existe pas encore ; 0 = prêt."""
+    if env_pret(cfg, etape):
+        return 0
+    Path(journal).parent.mkdir(parents=True, exist_ok=True)
+    t = cfg.etapes[etape]["env"]["type"]
+    return lancer_bash(script_creation_env(cfg, etape), cfg.pipelines, journal,
+                       f"création de l'environnement {t} : {etape}")
+
+
 def lancer_unite(cfg, racine, entrees, etape, reg):
     """Lance les commandes d'une unité ; retourne le code de retour."""
     ctx = Contexte(cfg, racine, entrees, etape, reg)
@@ -266,6 +364,9 @@ def lancer_unite(cfg, racine, entrees, etape, reg):
     script = "set -euo pipefail\n"
     if cfg.preparation:
         script += cfg.preparation + "\n"
+    activation = snippet_activation(cfg, etape)
+    if activation:
+        script += activation + "\n"
     script += "\n".join(commandes) + "\n"
 
     ctx.base["sortie"].mkdir(parents=True, exist_ok=True)
@@ -352,6 +453,21 @@ def executer(cfg, entretien):
         etat["unites"][cle] = {"statut": "en_cours",
                                "debut": datetime.now().isoformat(timespec="seconds")}
         sauver_etat(racine, etat)
+        if not env_pret(cfg, etape):
+            log(f"  {cle} : création de l'environnement "
+                f"{cfg.etapes[etape]['env']['type']} (1re utilisation dans ce lot)")
+            journal_env = racine / "logs" / f"env_{etape}.log"
+            code_env = assurer_env(cfg, etape, journal_env)
+            if code_env != 0:
+                statut = "interrompu" if _ARRET["demande"] else "echec"
+                etat["unites"][cle].update(statut=statut, duree_s=round(time.time() - t0),
+                                           journal=str(journal_env))
+                etat["statut"] = statut
+                etat["erreur"] = f"{cle} : création de l'environnement échouée (logs/env_{etape}.log)"
+                sauver_etat(racine, etat)
+                log(f"  {cle} : ÉCHEC de la création de l'environnement - voir {journal_env}")
+                return CODE_INTERROMPU if statut == "interrompu" else CODE_ECHEC
+            log(f"  {cle} : environnement prêt ({round(time.time() - t0) // 60} min)")
         try:
             code, journal = lancer_unite(cfg, racine, entrees, etape, reg)
         except KeyError as exc:      # variable {..} introuvable dans une commande
@@ -599,6 +715,13 @@ def main():
     if a.cmd == "soumettre":
         liste = lire_manifeste(a.manifeste) if a.manifeste else entrees_depuis_args(a)
         verifier_entrees(liste)
+        if cfg.installation == "frontend" and not a.simuler and not a.local:
+            for etape in ORDRE:
+                if not env_pret(cfg, etape):
+                    journal_env = cfg.pipelines / ".envs" / f"{etape}.install.log"
+                    log(f"Création de l'environnement '{etape}' sur le frontend (journal : {journal_env})")
+                    if assurer_env(cfg, etape, journal_env) != 0:
+                        sys.exit(f"Échec de la création de l'environnement '{etape}' : voir {journal_env}")
         soumettre_liste(cfg, liste, apres=a.apres, simuler=a.simuler,
                         local=a.local, forcer=a.forcer)
         return

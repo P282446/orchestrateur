@@ -23,6 +23,7 @@ Commandes :
         --video-psy V_P.wmv --fix-sujet F_S.txt --fix-psy F_P.txt [--attendre]
     python3 lancer_entretiens.py statut
     python3 lancer_entretiens.py recuperer [ENTRETIEN ...] [--sortie DOSSIER] [--avec-logs]
+    python3 lancer_entretiens.py journal ENTRETIEN [--unite segmentation_sujet] [--lignes 40]
     python3 lancer_entretiens.py relancer [ENTRETIEN ...]
 
 Manifeste (CSV) : entretien, video_sujet, video_psy, fix_sujet, fix_psy
@@ -56,7 +57,8 @@ from pathlib import Path
 G5K_LOGIN = "smbengue"
 G5K_SITE = "nancy"
 # Alias de votre ~/.ssh/config (ex. "nancy.g5k") ; None = connexion directe via
-# access.grid5000.fr avec G5K_LOGIN / G5K_SITE. "local" = mode essai sans Grid'5000.
+# access.grid5000.fr avec G5K_LOGIN / G5K_SITE (équivalent de :
+# ssh -J LOGIN@access.grid5000.fr LOGIN@SITE.grid5000.fr). "local" = mode essai sans Grid'5000.
 SSH_HOTE = None
 
 DOSSIER_RESULTATS = "~/resultats_entretiens"      # sur VOTRE machine
@@ -66,12 +68,12 @@ DOSSIER_LOTS_DISTANT = "~/pipelines"              # sur Grid'5000 : un sous-doss
 # Dépôts GitHub : (nom du dossier de clonage, URL, branche / tag / commit).
 # Les noms doivent correspondre aux {pipelines}/<nom>/... de config.ini.
 DEPOTS = [
-    ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"),
-    ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"),
-    ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"),
-    ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"),
-    ("transcription",     "git@github.com:P282446/Transcription.git",        "main"),
-    ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"),
+    ("orchestration",     "https://github.com/VOTRE_COMPTE/pipelines-entretiens.git", "main"),
+    ("eye-tracker-utils", "https://github.com/VOTRE_COMPTE/eye-tracker-utils.git",    "main"),
+    ("synchronisation",   "https://github.com/VOTRE_COMPTE/synchronisation.git",      "main"),
+    ("mesures_manquantes", "https://github.com/VOTRE_COMPTE/mesures_manquantes.git",  "main"),
+    ("transcription",     "https://github.com/VOTRE_COMPTE/transcription.git",        "main"),
+    ("analyse",           "https://github.com/VOTRE_COMPTE/analyse.git",              "main"),
 ]
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
 FICHIER_ORCHESTRATEUR = "orchestrateur.py"
@@ -103,13 +105,23 @@ class Hote:
         if ssh_hote:
             self.cible = ssh_hote
         else:
+            if G5K_LOGIN.startswith("votre_"):
+                sys.exit("Renseignez G5K_LOGIN (votre identifiant Grid'5000) en haut de ce fichier, "
+                         "ou utilisez un alias SSH (SSH_HOTE = \"nancy.g5k\").")
             self.ssh += ["-J", f"{G5K_LOGIN}@access.grid5000.fr"]
-            self.cible = f"{G5K_LOGIN}@{G5K_SITE}"
+            self.cible = f"{G5K_LOGIN}@{G5K_SITE}.grid5000.fr"
 
     def executer(self, script, capture=False, check=True):
         cmd = ["bash", "-s"] if self.local else self.ssh + [self.cible, "bash -s"]
         r = subprocess.run(cmd, input="set -euo pipefail\n" + script, text=True,
                            capture_output=capture)
+        if check and r.returncode == 255 and not self.local:
+            test = " ".join(q(x) for x in self.ssh + [self.cible, "hostname"])
+            sys.exit("Connexion SSH à Grid'5000 impossible (code 255).\n"
+                     f"Testez à la main :  {test}\n"
+                     "Pistes : identifiant G5K_LOGIN incorrect ; clé SSH non enregistrée sur Grid'5000 "
+                     "ou non chargée (ssh-add) ; ou utilisez un alias de ~/.ssh/config "
+                     "(SSH_HOTE = \"nancy.g5k\", voir le README).")
         if check and r.returncode != 0:
             detail = (r.stderr or "").strip() if capture else ""
             sys.exit(f"Commande distante en échec (code {r.returncode}). {detail}".strip())
@@ -150,6 +162,10 @@ class Hote:
 # Entrées locales
 # ------------------------------------------------------------------------------
 def lire_manifeste(chemin):
+    if not Path(chemin).expanduser().is_file():
+        sys.exit(f"Manifeste introuvable : {chemin}\n"
+                 "Créez ce fichier CSV (modèle : entretiens_exemple.csv) avec les colonnes :\n"
+                 "  entretien,video_sujet,video_psy,fix_sujet,fix_psy")
     base = Path(chemin).expanduser().resolve().parent
     with open(chemin, encoding="utf-8-sig", newline="") as f:
         entete = f.readline()
@@ -247,20 +263,33 @@ def statut_json(hote, home):
     return []
 
 
+def fin_du_journal(hote, e, lignes=40, unite=None):
+    """Affiche la fin du journal (le plus récent, ou celui de l'unité indiquée)."""
+    logs = q(e["racine"]) + "/logs"
+    if unite:
+        choix = f'f={logs}/{q(unite)}.log\n'
+    else:
+        choix = f'f=$(ls -t {logs}/*.log 2>/dev/null | head -n 1 || true)\n'
+    script = choix + ('if [ -n "$f" ] && [ -f "$f" ]; then echo "--- $f"; tail -n %d "$f"; '
+                      'else echo "(aucun journal trouvé)"; fi\n' % lignes)
+    hote.executer(script, check=False)
+
+
 def recuperer(hote, statuts, noms, dest_local, avec_logs=False):
     faits = []
     for e in statuts:
         if noms and e["entretien"] not in noms:
             continue
-        if e["statut"] != "termine":
-            print(f"  {e['entretien']} : {e['statut']} (pas encore terminé)")
-            continue
         cible = Path(dest_local) / e["entretien"]
-        hote.telecharger(e["resultats"], cible)
+        if e["statut"] == "termine":
+            hote.telecharger(e["resultats"], cible)
+            print(f"  {e['entretien']} : résultats récupérés dans {cible}")
+            faits.append(e["entretien"])
+        else:
+            print(f"  {e['entretien']} : {e['statut']} (résultats pas disponibles) {e['erreur']}".rstrip())
         if avec_logs:
             hote.telecharger(e["racine"] + "/logs", cible / "_suivi" / "logs")
-        print(f"  {e['entretien']} : résultats récupérés dans {cible}")
-        faits.append(e["entretien"])
+            print(f"  {e['entretien']} : journaux récupérés dans {cible / '_suivi' / 'logs'}")
     return faits
 
 
@@ -276,6 +305,13 @@ def cmd_verifier(hote, a):
               'echo "python3  : $(python3 --version 2>&1)"\n'
               'if command -v oarsub >/dev/null; then echo "oarsub   : présent"; '
               'else echo "oarsub   : ABSENT (normal en mode essai local)"; fi\n')
+    script += ('c=$(command -v conda || true)\n'
+               'for x in "$HOME/miniforge3/bin/conda" "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda"; '
+               'do if [ -z "$c" ] && [ -x "$x" ]; then c=$x; fi; done\n'
+               'if [ -n "$c" ]; then echo "conda    : $c"; '
+               'else echo "conda    : ABSENT (nécessaire pour l\'environnement de segmentation)"; fi\n'
+               'if python3 -c "import ensurepip" 2>/dev/null; then echo "venv     : possible"; '
+               'else echo "venv     : IMPOSSIBLE (paquet python3-venv manquant)"; fi\n')
     for nom, url, ref in depots:
         script += (f'if git ls-remote --exit-code {q(url)} >/dev/null 2>&1; then echo "dépôt {nom} : accessible"; '
                    f'else echo "dépôt {nom} : INACCESSIBLE ({url})"; fi\n')
@@ -350,7 +386,9 @@ def attendre(hote, home, noms, dest_local):
                     hote.executer(SCRIPT_DERNIER_LOT.format(lots=lots)
                                   + commande_orchestrateur("relancer", '"$lot"', q(n)))
                 elif e["statut"] in ("echec", "interrompu"):
-                    print(f"  {n} : {e['statut']} - {e['erreur']} (voir : statut, recuperer --avec-logs)")
+                    print(f"  {n} : {e['statut']} - {e['erreur']}")
+                    fin_du_journal(hote, e)
+                    print(f"  (journal complet : python3 {Path(__file__).name} recuperer {n} --avec-logs)")
                     abandonnes.add(n)
             restants = [n for n in noms if n not in termines and n not in abandonnes]
             if restants:
@@ -379,6 +417,14 @@ def cmd_recuperer(hote, a):
     faits = recuperer(hote, statut_json(hote, home), a.entretiens, dest, a.avec_logs)
     if not faits:
         print("Rien à récupérer pour l'instant.")
+
+
+def cmd_journal(hote, a):
+    home = hote.home()
+    statuts = {e["entretien"]: e for e in statut_json(hote, home)}
+    if a.entretien not in statuts:
+        sys.exit(f"Entretien inconnu : {a.entretien} (connus : {sorted(statuts)})")
+    fin_du_journal(hote, statuts[a.entretien], a.lignes, a.unite)
 
 
 def cmd_relancer(hote, a):
@@ -418,6 +464,11 @@ def main():
     s.add_argument("entretiens", nargs="*")
     s.add_argument("--sortie")
     s.add_argument("--avec-logs", action="store_true", help="Télécharger aussi les journaux")
+    s = sp.add_parser("journal", help="Afficher la fin du journal d'un entretien (diagnostic d'échec)")
+    commun(s)
+    s.add_argument("entretien")
+    s.add_argument("--unite", help="Journal d'une étape précise, ex. segmentation_sujet")
+    s.add_argument("--lignes", type=int, default=40)
     s = sp.add_parser("relancer", help="Resoumettre des entretiens en échec ou interrompus")
     commun(s)
     s.add_argument("entretiens", nargs="*")
@@ -425,7 +476,8 @@ def main():
     a = p.parse_args()
     hote = Hote(a.hote or SSH_HOTE)
     {"verifier": cmd_verifier, "lancer": cmd_lancer, "statut": cmd_statut,
-     "recuperer": cmd_recuperer, "relancer": cmd_relancer}[a.cmd](hote, a)
+     "recuperer": cmd_recuperer, "relancer": cmd_relancer,
+     "journal": cmd_journal}[a.cmd](hote, a)
 
 
 if __name__ == "__main__":
