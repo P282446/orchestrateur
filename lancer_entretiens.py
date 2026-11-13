@@ -24,10 +24,13 @@ Commandes :
     python3 lancer_entretiens.py statut
     python3 lancer_entretiens.py recuperer [ENTRETIEN ...] [--sortie DOSSIER] [--avec-logs]
     python3 lancer_entretiens.py journal ENTRETIEN [--unite segmentation_sujet] [--lignes 40]
+    python3 lancer_entretiens.py arbre [--profondeur 3]
     python3 lancer_entretiens.py relancer [ENTRETIEN ...]
 
 Manifeste (CSV) : entretien, video_sujet, video_psy, fix_sujet, fix_psy
 (chemins locaux, relatifs au manifeste ou absolus).
+
+Réglages (login, dépôts GitHub...) : fichier lanceur.ini à côté de ce script.
 
 Prérequis sur votre machine : Python 3.8+, ssh et rsync (Linux/macOS ou WSL).
 Prérequis une seule fois sur Grid'5000 : voir le README (environnement Python,
@@ -43,6 +46,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -52,7 +56,8 @@ import time
 from pathlib import Path
 
 # ==============================================================================
-# CONFIGURATION - à adapter une seule fois
+# CONFIGURATION - valeurs par défaut. Vos réglages personnels vont dans lanceur.ini (à côté de
+# ce fichier, modèle : lanceur_exemple.ini) : ils remplacent ceux-ci et survivent aux mises à jour.
 # ==============================================================================
 G5K_LOGIN = "smbengue"
 G5K_SITE = "nancy"
@@ -67,14 +72,15 @@ DOSSIER_LOTS_DISTANT = "~/pipelines"              # sur Grid'5000 : un sous-doss
 
 # Dépôts GitHub : (nom du dossier de clonage, URL, branche / tag / commit).
 # Les noms doivent correspondre aux {pipelines}/<nom>/... de config.ini.
-DEPOTS = [
-    ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"),
-    ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"),
-    ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"),
-    ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"),
-    ("transcription",     "git@github.com:P282446/Transcription.git",        "main"),
-    ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"),
+DEPOTS = [ 
+   ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"), 
+   ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"), 
+   ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"), 
+   ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"), 
+   ("transcription",     "git@github.com:P282446/Transcription.git",        "main"), 
+   ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"), 
 ]
+ 
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
 FICHIER_ORCHESTRATEUR = "orchestrateur.py"
 FICHIER_CONFIG = "config.ini"
@@ -82,6 +88,43 @@ FICHIER_CONFIG = "config.ini"
 INTERVALLE_ATTENTE_MIN = 10   # --attendre : fréquence de vérification
 RELANCES_AUTO = 1             # --attendre : relances d'un entretien interrompu (fin des 12 h)
 # ==============================================================================
+
+def charger_reglages():
+    """Réglages personnels : fichier lanceur.ini placé à côté de ce script (ou indiqué par
+    la variable d'environnement LANCEUR_CONFIG). Ils remplacent les valeurs ci-dessus, ce qui
+    permet de remplacer ce fichier par une nouvelle version sans perdre ses réglages."""
+    import configparser
+    chemin = Path(os.environ.get("LANCEUR_CONFIG") or Path(__file__).resolve().with_name("lanceur.ini"))
+    if not chemin.is_file():
+        return None
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = str
+    cp.read(chemin, encoding="utf-8")
+    g = globals()
+    textes = {"g5k_login": "G5K_LOGIN", "g5k_site": "G5K_SITE", "ssh_hote": "SSH_HOTE",
+              "dossier_resultats": "DOSSIER_RESULTATS", "dossier_entrees_distant": "DOSSIER_ENTREES_DISTANT",
+              "dossier_lots_distant": "DOSSIER_LOTS_DISTANT", "depot_orchestration": "DEPOT_ORCHESTRATION",
+              "fichier_orchestrateur": "FICHIER_ORCHESTRATEUR", "fichier_config": "FICHIER_CONFIG"}
+    entiers = {"intervalle_attente_min": "INTERVALLE_ATTENTE_MIN", "relances_auto": "RELANCES_AUTO"}
+    if cp.has_section("lanceur"):
+        for cle, val in cp["lanceur"].items():
+            val = val.strip()
+            if cle in textes:
+                g[textes[cle]] = (val or None) if cle == "ssh_hote" else val
+            elif cle in entiers:
+                g[entiers[cle]] = int(val)
+            else:
+                sys.exit(f"{chemin.name} : réglage inconnu '{cle}'")
+    if cp.has_section("depots"):
+        depots = []
+        for nom, val in cp["depots"].items():
+            morceaux = val.split()
+            if not morceaux:
+                sys.exit(f"{chemin.name} : URL manquante pour le dépôt '{nom}'")
+            depots.append((nom.strip(), morceaux[0], morceaux[1] if len(morceaux) > 1 else "main"))
+        DEPOTS[:] = depots
+    return chemin
+
 
 CLES = ["video_sujet", "video_psy", "fix_sujet", "fix_psy"]
 q = shlex.quote
@@ -323,14 +366,20 @@ def cmd_lancer(hote, a):
     verifier_locaux(liste)
     depots = depots_effectifs(a.ref)
     if any("VOTRE_COMPTE" in d[1] for d in depots) and not hote.local:
-        sys.exit("Renseignez d'abord G5K_LOGIN et les URL des dépôts (liste DEPOTS) en haut de ce fichier.")
+        sys.exit("Renseignez votre login et les URL de vos dépôts GitHub dans le fichier lanceur.ini "
+                 "(à placer à côté de lancer_entretiens.py ; modèle : lanceur_exemple.ini).")
 
     home = hote.home()
-    lot_id = time.strftime("%Y%m%d-%H%M%S")
+    lot_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)   # unique même à la seconde près
     lot = f"{dev(DOSSIER_LOTS_DISTANT, home)}/{lot_id}"
     print(f"== 1/4  Récupération des pipelines depuis GitHub (lot {lot_id})")
     hote.executer(script_clonage(lot, depots))
 
+    print("   Contrôle de la configuration")
+    r = hote.executer(commande_orchestrateur("controler", q(lot)), check=False)
+    if r.returncode != 0:
+        sys.exit("\nArrêt avant l'envoi des vidéos : corrigez lanceur.ini ([depots]) ou config.ini, puis relancez.\n"
+                 f"Pour voir ce qui a été cloné : python3 {Path(__file__).name} arbre")
     print("== 2/4  Envoi des entrées")
     racine_entrees = dev(DOSSIER_ENTREES_DISTANT, home)
     sortie_csv = io.StringIO()
@@ -427,6 +476,16 @@ def cmd_journal(hote, a):
     fin_du_journal(hote, statuts[a.entretien], a.lignes, a.unite)
 
 
+def cmd_arbre(hote, a):
+    """Arborescence du dernier lot de pipelines clonés (pour vérifier les chemins de config.ini)."""
+    home = hote.home()
+    lots = dev(DOSSIER_LOTS_DISTANT, home)
+    hote.executer(SCRIPT_DERNIER_LOT.format(lots=lots)
+                  + 'echo "Dernier lot : $lot"\n'
+                  + f'find "$lot" -maxdepth {a.profondeur} -not -path "*/.git" -not -path "*/.git/*" '
+                    '-not -path "*/.envs" -not -path "*/.envs/*" | sed "s#^$lot/##" | sort\n')
+
+
 def cmd_relancer(hote, a):
     home = hote.home()
     lots = dev(DOSSIER_LOTS_DISTANT, home)
@@ -469,15 +528,19 @@ def main():
     s.add_argument("entretien")
     s.add_argument("--unite", help="Journal d'une étape précise, ex. segmentation_sujet")
     s.add_argument("--lignes", type=int, default=40)
+    s = sp.add_parser("arbre", help="Afficher l'arborescence des pipelines clonés (dernier lot)")
+    commun(s)
+    s.add_argument("--profondeur", type=int, default=3)
     s = sp.add_parser("relancer", help="Resoumettre des entretiens en échec ou interrompus")
     commun(s)
     s.add_argument("entretiens", nargs="*")
 
     a = p.parse_args()
+    charger_reglages()
     hote = Hote(a.hote or SSH_HOTE)
     {"verifier": cmd_verifier, "lancer": cmd_lancer, "statut": cmd_statut,
      "recuperer": cmd_recuperer, "relancer": cmd_relancer,
-     "journal": cmd_journal}[a.cmd](hote, a)
+     "journal": cmd_journal, "arbre": cmd_arbre}[a.cmd](hote, a)
 
 
 if __name__ == "__main__":
