@@ -72,15 +72,14 @@ DOSSIER_LOTS_DISTANT = "~/pipelines"              # sur Grid'5000 : un sous-doss
 
 # Dépôts GitHub : (nom du dossier de clonage, URL, branche / tag / commit).
 # Les noms doivent correspondre aux {pipelines}/<nom>/... de config.ini.
-DEPOTS = [ 
-   ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"), 
-   ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"), 
-   ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"), 
-   ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"), 
-   ("transcription",     "git@github.com:P282446/Transcription.git",        "main"), 
-   ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"), 
+DEPOTS = [
+    ("orchestration",     "https://github.com/VOTRE_COMPTE/pipelines-entretiens.git", "main"),
+    ("segmentation",     "https://github.com/VOTRE_COMPTE/segmentation.git",         "main"),
+    ("synchronisation",   "https://github.com/VOTRE_COMPTE/synchronisation.git",      "main"),
+    ("mesures_manquantes", "https://github.com/VOTRE_COMPTE/mesures_manquantes.git",  "main"),
+    ("transcription",     "https://github.com/VOTRE_COMPTE/transcription.git",        "main"),
+    ("analyse",           "https://github.com/VOTRE_COMPTE/analyse.git",              "main"),
 ]
- 
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
 FICHIER_ORCHESTRATEUR = "orchestrateur.py"
 FICHIER_CONFIG = "config.ini"
@@ -99,7 +98,9 @@ def charger_reglages():
         return None
     cp = configparser.ConfigParser(interpolation=None)
     cp.optionxform = str
-    cp.read(chemin, encoding="utf-8")
+    # espaces insécables / invisibles (copier-coller depuis une page web) -> espaces normaux
+    texte = chemin.read_text(encoding="utf-8-sig").replace("\u00a0", " ").replace("\u200b", "")
+    cp.read_string(texte)
     g = globals()
     textes = {"g5k_login": "G5K_LOGIN", "g5k_site": "G5K_SITE", "ssh_hote": "SSH_HOTE",
               "dossier_resultats": "DOSSIER_RESULTATS", "dossier_entrees_distant": "DOSSIER_ENTREES_DISTANT",
@@ -376,8 +377,14 @@ def cmd_lancer(hote, a):
     hote.executer(script_clonage(lot, depots))
 
     print("   Contrôle de la configuration")
-    r = hote.executer(commande_orchestrateur("controler", q(lot)), check=False)
+    r = hote.executer(commande_orchestrateur("controler", q(lot)), capture=True, check=False)
+    sys.stdout.write(r.stdout or "")
+    sys.stderr.write(r.stderr or "")
     if r.returncode != 0:
+        if "invalid choice" in (r.stderr or ""):
+            sys.exit("\nL'orchestrateur cloné depuis GitHub est trop ancien (il ne connaît pas la commande "
+                     "'controler').\nPoussez la dernière version de orchestrateur.py et config.ini dans le dépôt "
+                     f"'{DEPOT_ORCHESTRATION}', puis relancez.")
         sys.exit("\nArrêt avant l'envoi des vidéos : corrigez lanceur.ini ([depots]) ou config.ini, puis relancez.\n"
                  f"Pour voir ce qui a été cloné : python3 {Path(__file__).name} arbre")
     print("== 2/4  Envoi des entrées")

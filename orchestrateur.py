@@ -428,6 +428,7 @@ def assurer_env(cfg, etape, journal):
     if env_pret(cfg, etape):
         return 0
     Path(journal).parent.mkdir(parents=True, exist_ok=True)
+    Path(journal).unlink(missing_ok=True)      # journal propre pour cette tentative
     t = cfg.etapes[etape]["env"]["type"]
     try:
         script = script_creation_env(cfg, etape)
@@ -458,6 +459,44 @@ AIDE_SHELL = r"""trouver() {
   echo "$f"
 }
 """
+
+
+def fichier_dans_depot(dossier, nom):
+    return any(not (DOSSIERS_IGNORES & set(p.relative_to(dossier).parts))
+               for p in Path(dossier).rglob(nom))
+
+
+def controler_config(cfg):
+    """Vérifie que tout ce que config.ini référence existe dans le lot cloné :
+    dépôts, scripts (cherchés avec 'trouver'), requirements, dossiers 'sources'."""
+    clones = sorted(d.name for d in cfg.pipelines.iterdir() if d.is_dir() and not d.name.startswith("."))
+    erreurs = []
+
+    def ajouter(msg):
+        if msg not in erreurs:
+            erreurs.append(msg)
+
+    for etape in ORDRE:
+        e = cfg.etapes[etape]
+        texte = "\n".join(e["commandes"])
+        for depot in re.findall(r"\{pipelines\}/([^\s/\"'{}$]+)", texte):
+            if not (cfg.pipelines / depot).is_dir():
+                ajouter(f"[{etape}] le dépôt '{depot}' n'existe pas dans le lot")
+        for depot, fichier in re.findall(r"trouver\s+\{pipelines\}/([^\s/]+)\s+([^\s)\"']+)", texte):
+            d = cfg.pipelines / depot
+            if d.is_dir() and not fichier_dans_depot(d, fichier):
+                ajouter(f"[{etape}] '{fichier}' est introuvable dans le dépôt '{depot}'")
+        env = e["env"]
+        if env["requirements"] and not Path(env["requirements"]).is_file():
+            ajouter(f"[{etape}] requirements introuvable : {env['requirements']}")
+        for src in shlex.split(env["sources"]):
+            if not Path(src).is_dir():
+                ajouter(f"[{etape}] dossier 'sources' introuvable : {src}")
+    if erreurs:
+        erreurs.append(f"Dépôts réellement clonés dans ce lot : {', '.join(clones) or '(aucun)'}")
+        erreurs.append("Les noms de la section [depots] de lanceur.ini doivent correspondre à ceux "
+                       "utilisés dans config.ini ({pipelines}/<nom>/...).")
+    return erreurs
 
 
 def lancer_unite(cfg, racine, entrees, etape, reg):
@@ -796,6 +835,9 @@ def main():
     commun(s)
     s.add_argument("--entretien", required=True)
 
+    s = sp.add_parser("controler", help="Vérifier que la configuration correspond aux dépôts clonés")
+    commun(s)
+
     s = sp.add_parser("dependances", help="Afficher les packages détectés dans des dossiers de scripts")
     s.add_argument("dossiers", nargs="+")
 
@@ -822,6 +864,14 @@ def main():
         return
     cfg = Config(a.config)
 
+    if a.cmd == "controler":
+        erreurs = controler_config(cfg)
+        if erreurs:
+            print("CONFIGURATION INCOHÉRENTE :", file=sys.stderr)
+            print("\n".join("  - " + x for x in erreurs), file=sys.stderr)
+            sys.exit(1)
+        print("Configuration cohérente avec les dépôts clonés.")
+        return
     if a.cmd == "executer":
         sys.exit(executer(cfg, a.entretien))
     if a.cmd == "statut":
@@ -830,6 +880,9 @@ def main():
     if a.cmd == "soumettre":
         liste = lire_manifeste(a.manifeste) if a.manifeste else entrees_depuis_args(a)
         verifier_entrees(liste)
+        erreurs = controler_config(cfg)
+        if erreurs:
+            sys.exit("CONFIGURATION INCOHÉRENTE :\n" + "\n".join("  - " + x for x in erreurs))
         if cfg.installation == "frontend" and not a.simuler and not a.local:
             for etape in ORDRE:
                 if not env_pret(cfg, etape):
