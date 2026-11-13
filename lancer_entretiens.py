@@ -73,12 +73,12 @@ DOSSIER_LOTS_DISTANT = "~/pipelines"              # sur Grid'5000 : un sous-doss
 # Dépôts GitHub : (nom du dossier de clonage, URL, branche / tag / commit).
 # Les noms doivent correspondre aux {pipelines}/<nom>/... de config.ini.
 DEPOTS = [ 
-   ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"), 
-   ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"), 
-   ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"), 
-   ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"), 
-   ("transcription",     "git@github.com:P282446/Transcription.git",        "main"), 
-   ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"), 
+   ("orchestration",     "git@github.com:P282446/orchestrateur.git", "main"), 
+   ("eye-tracker-utils", "git@github.com:P282446/segmentation.git",    "main"), 
+   ("synchronisation",   "git@github.com:P282446/synchro_video_Fcihier.git",      "main"), 
+   ("mesures_manquantes","git@github.com:P282446/mesures_manquantes.git",  "main"), 
+   ("transcription",     "git@github.com:P282446/Transcription.git",        "main"), 
+   ("analyse",           "git@github.com:P282446/Analyse_.git",              "main"), 
 ]
  
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
