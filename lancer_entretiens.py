@@ -25,6 +25,7 @@ Commandes :
     python3 lancer_entretiens.py recuperer [ENTRETIEN ...] [--sortie DOSSIER] [--avec-logs]
     python3 lancer_entretiens.py journal ENTRETIEN [--unite segmentation_sujet] [--lignes 40]
     python3 lancer_entretiens.py arbre [--profondeur 3]
+    python3 lancer_entretiens.py televerser DOSSIER_LOCAL [--vers ~/modeles]
     python3 lancer_entretiens.py relancer [ENTRETIEN ...]
 
 Manifeste (CSV) : entretien, video_sujet, video_psy, fix_sujet, fix_psy
@@ -80,6 +81,10 @@ DEPOTS = [
     ("transcription",     "https://github.com/VOTRE_COMPTE/transcription.git",        "main"),
     ("analyse",           "https://github.com/VOTRE_COMPTE/analyse.git",              "main"),
 ]
+# Ressources hors Git (modèles, poids, gros fichiers) : (dépôt, chemin dans le dépôt, chemin local).
+# Envoyées une seule fois sur Grid'5000 (~/ressources/...), puis reliées dans chaque lot cloné.
+# À renseigner dans la section [ressources] de lanceur.ini.
+RESSOURCES = []
 DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers suivants
 FICHIER_ORCHESTRATEUR = "orchestrateur.py"
 FICHIER_CONFIG = "config.ini"
@@ -100,7 +105,23 @@ def charger_reglages():
     cp.optionxform = str
     # espaces insécables / invisibles (copier-coller depuis une page web) -> espaces normaux
     texte = chemin.read_text(encoding="utf-8-sig").replace("\u00a0", " ").replace("\u200b", "")
-    cp.read_string(texte)
+    # Tolérance : lignes de commande collées par erreur avant la 1re section (cd..., cat > ... <<'EOF')
+    # ou la ligne EOF finale.
+    lignes = texte.splitlines()
+    debut = next((i for i, x in enumerate(lignes) if x.lstrip().startswith("[")), None)
+    if debut is None:
+        sys.exit(f"{chemin} : aucune section trouvée. Le fichier doit contenir [lanceur] et [depots] "
+                 "(voir lanceur_exemple.ini).")
+    if debut > 0:
+        print(f"ATTENTION : {chemin.name} : {debut} ligne(s) ignorée(s) avant [{lignes[debut].strip('[] ')}] "
+              "(ce sont des commandes de terminal collées dans le fichier ; supprimez-les).")
+    texte = "\n".join(x for x in lignes[debut:] if x.strip() != "EOF")
+    try:
+        cp.read_string(texte)
+    except configparser.Error as exc:
+        sys.exit(f"{chemin} : fichier de réglages invalide.\n{str(exc).splitlines()[0]}\n"
+                 "Le fichier ne doit contenir que des lignes 'nom = valeur' sous [lanceur] et [depots] "
+                 "(modèle : lanceur_exemple.ini).")
     g = globals()
     textes = {"g5k_login": "G5K_LOGIN", "g5k_site": "G5K_SITE", "ssh_hote": "SSH_HOTE",
               "dossier_resultats": "DOSSIER_RESULTATS", "dossier_entrees_distant": "DOSSIER_ENTREES_DISTANT",
@@ -124,6 +145,15 @@ def charger_reglages():
                 sys.exit(f"{chemin.name} : URL manquante pour le dépôt '{nom}'")
             depots.append((nom.strip(), morceaux[0], morceaux[1] if len(morceaux) > 1 else "main"))
         DEPOTS[:] = depots
+    if cp.has_section("ressources"):
+        RESSOURCES[:] = []
+        for cle, val in cp["ressources"].items():
+            depot, _, rel = cle.strip().partition("/")
+            rel = rel.strip("/")
+            if not depot or not rel or ".." in Path(rel).parts or not val.strip():
+                sys.exit(f"{chemin.name} : [ressources] : écrivez  <depot>/<chemin dans le depot> = <chemin local>,"
+                         " par ex.  segmentation/models = ~/Bureau/segmentation/models")
+            RESSOURCES.append((depot, rel, val.strip()))
     return chemin
 
 
@@ -195,6 +225,14 @@ class Hote:
     def envoyer(self, src_local, dest_distant):
         self.executer("mkdir -p " + q(os.path.dirname(dest_distant)))
         self._rsync(src_local, dest_distant)
+
+    def envoyer_ressource(self, src_local, dest_distant):
+        """Dossier (contenu synchronisé, seuls les changements sont renvoyés) ou fichier."""
+        if os.path.isdir(src_local):
+            self.executer("mkdir -p " + q(dest_distant))
+            self._rsync(src_local.rstrip("/") + "/", dest_distant.rstrip("/") + "/")
+        else:
+            self.envoyer(src_local, dest_distant)
 
     def telecharger(self, dossier_distant, dossier_local):
         Path(dossier_local).mkdir(parents=True, exist_ok=True)
@@ -376,6 +414,23 @@ def cmd_lancer(hote, a):
     print(f"== 1/4  Récupération des pipelines depuis GitHub (lot {lot_id})")
     hote.executer(script_clonage(lot, depots))
 
+    if RESSOURCES:
+        print("   Ressources hors Git (modèles, poids) : synchronisation et liens")
+        noms_depots = [d[0] for d in depots]
+        liens = []
+        for depot, rel, local in RESSOURCES:
+            if depot not in noms_depots:
+                sys.exit(f"[ressources] : dépôt inconnu '{depot}' (connus : {noms_depots})")
+            src = Path(os.path.expanduser(local))
+            if not src.exists():
+                sys.exit(f"[ressources] : introuvable sur votre machine : {src}")
+            dest = f"{home}/ressources/{depot}/{rel}"
+            print(f"  {depot}/{rel}  <-  {src}")
+            hote.envoyer_ressource(str(src), dest)
+            cible = f"{lot}/{depot}/{rel}"
+            liens.append(f"rm -rf {q(cible)}; mkdir -p {q(os.path.dirname(cible))}; ln -s {q(dest)} {q(cible)}")
+        hote.executer("\n".join(liens) + "\n")
+
     print("   Contrôle de la configuration")
     r = hote.executer(commande_orchestrateur("controler", q(lot)), capture=True, check=False)
     sys.stdout.write(r.stdout or "")
@@ -386,6 +441,10 @@ def cmd_lancer(hote, a):
                      "'controler').\nPoussez la dernière version de orchestrateur.py et config.ini dans le dépôt "
                      f"'{DEPOT_ORCHESTRATION}', puis relancez.")
         sys.exit("\nArrêt avant l'envoi des vidéos : corrigez lanceur.ini ([depots]) ou config.ini, puis relancez.\n"
+                 f"RAPPEL : config.ini et orchestrateur.py sont lus depuis GitHub (dépôt '{DEPOT_ORCHESTRATION}'), "
+                 "pas depuis ce dossier.\nAprès toute modification : git add, git commit, git push. "
+                 "Si le numéro de version affiché à l'étape 1 pour ce dépôt n'a pas changé, "
+                 "votre push n'est pas passé.\n"
                  f"Pour voir ce qui a été cloné : python3 {Path(__file__).name} arbre")
     print("== 2/4  Envoi des entrées")
     racine_entrees = dev(DOSSIER_ENTREES_DISTANT, home)
@@ -483,6 +542,22 @@ def cmd_journal(hote, a):
     fin_du_journal(hote, statuts[a.entretien], a.lignes, a.unite)
 
 
+def cmd_televerser(hote, a):
+    """Envoie un dossier/fichier (ex. un modèle trop gros pour GitHub) vers ~/modeles/ sur Grid'5000."""
+    src = Path(a.source).expanduser().resolve()
+    if not src.exists():
+        sys.exit(f"Introuvable : {src}")
+    home = hote.home()
+    dest = f"{dev(a.vers, home).rstrip('/')}/{src.name}"
+    print(f"Envoi de {src} vers {dest}")
+    if src.is_dir():
+        hote.executer("mkdir -p " + q(dest))
+        hote._rsync(str(src).rstrip("/") + "/", dest.rstrip("/") + "/")
+    else:
+        hote.envoyer(str(src), dest)
+    print("Terminé.")
+
+
 def cmd_arbre(hote, a):
     """Arborescence du dernier lot de pipelines clonés (pour vérifier les chemins de config.ini)."""
     home = hote.home()
@@ -535,6 +610,10 @@ def main():
     s.add_argument("entretien")
     s.add_argument("--unite", help="Journal d'une étape précise, ex. segmentation_sujet")
     s.add_argument("--lignes", type=int, default=40)
+    s = sp.add_parser("televerser", help="Envoyer un modèle/dossier (trop gros pour GitHub) vers ~/modeles/")
+    commun(s)
+    s.add_argument("source", help="Dossier ou fichier local, ex. ~/Bureau/segmentation/models/rmbg1.4.model")
+    s.add_argument("--vers", default="~/modeles", help="Dossier distant (défaut : ~/modeles)")
     s = sp.add_parser("arbre", help="Afficher l'arborescence des pipelines clonés (dernier lot)")
     commun(s)
     s.add_argument("--profondeur", type=int, default=3)
@@ -547,7 +626,8 @@ def main():
     hote = Hote(a.hote or SSH_HOTE)
     {"verifier": cmd_verifier, "lancer": cmd_lancer, "statut": cmd_statut,
      "recuperer": cmd_recuperer, "relancer": cmd_relancer,
-     "journal": cmd_journal, "arbre": cmd_arbre}[a.cmd](hote, a)
+     "journal": cmd_journal, "arbre": cmd_arbre,
+     "televerser": cmd_televerser}[a.cmd](hote, a)
 
 
 if __name__ == "__main__":
