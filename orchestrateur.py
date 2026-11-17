@@ -132,6 +132,18 @@ class Config:
             self.etapes[e] = {"commandes": cmds, "portee": portee,
                               "sortie": s.get("sortie", "").strip(), "env": env}
 
+        # Variables personnelles (section [variables]) : disponibles comme {nom} dans les commandes
+        self.variables = {}
+        if cp.has_section("variables"):
+            for nom, val in cp["variables"].items():
+                self.variables[nom] = os.path.expanduser(val.strip())
+        # Prérequis (facultatif) : "nom = commande shell :: message si la commande échoue"
+        self.prerequis = []
+        if cp.has_section("prerequis"):
+            for nom, val in cp["prerequis"].items():
+                cmd, _, msg = val.partition(" :: ")
+                self.prerequis.append((nom, cmd.strip(), msg.strip() or nom))
+
     def dossier(self, entretien):
         return self.racine_travail / nettoyer_nom(entretien)
 
@@ -175,6 +187,7 @@ class Contexte:
             "python": cfg.python, "pipelines": cfg.pipelines,
             "video_transcription": entrees[f"video_{cfg.video_transcription}"],
         }
+        self.base.update(cfg.variables)
         self.base.update({k: entrees[k] for k in CLES_ENTREES})
         self.base.update(entrees.get("extra", {}))   # entrées facultatives (colonnes en plus du manifeste)
         portee = cfg.etapes[etape]["portee"]
@@ -492,6 +505,12 @@ def controler_config(cfg):
         for src in shlex.split(env["sources"]):
             if not Path(src).is_dir():
                 ajouter(f"[{etape}] dossier 'sources' introuvable : {src}")
+    for nom, cmd, msg in cfg.prerequis:
+        cmd = cmd.replace("{pipelines}", shlex.quote(str(cfg.pipelines)))
+        for k, v in cfg.variables.items():
+            cmd = cmd.replace("{" + k + "}", shlex.quote(v))
+        if subprocess.run(["bash", "-c", cmd], capture_output=True).returncode != 0:
+            ajouter(f"prérequis non satisfait ({nom}) : {msg}")
     if erreurs:
         erreurs.append(f"Dépôts réellement clonés dans ce lot : {', '.join(clones) or '(aucun)'}")
         erreurs.append("Les noms de la section [depots] de lanceur.ini doivent correspondre à ceux "
@@ -513,6 +532,8 @@ def lancer_unite(cfg, racine, entrees, etape, reg):
 
     ctx.base["sortie"].mkdir(parents=True, exist_ok=True)
     journal = racine / "logs" / f"{cle_unite(etape, reg).replace(':', '_')}.log"
+    if journal.exists():
+        journal.replace(journal.with_name(journal.stem + ".prev.log"))
     with open(journal, "ab") as f:
         f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} : {cle_unite(etape, reg)} =====\n"
                 .encode())
@@ -558,6 +579,7 @@ def executer(cfg, entretien):
     limite = debut + walltime - cfg.marge_min * 60
 
     etat["statut"] = "en_cours"
+    etat.pop("erreur", None)
     etat["tentatives"] += 1
     if os.environ.get("OAR_JOB_ID"):
         etat["job_en_cours"] = os.environ["OAR_JOB_ID"]

@@ -330,6 +330,8 @@ def script_clonage(lot, depots):
             l.append(f"git clone --quiet {q(url)} {dest} && git -C {dest} checkout --quiet {q(ref)}")
         else:
             l.append(f"git clone --quiet --depth 1 --branch {q(ref)} {q(url)} {dest}")
+        l.append(f'if git lfs version >/dev/null 2>&1; then git -C {dest} lfs pull --quiet || '
+                 f'echo "  ATTENTION : git lfs pull a echoue pour {nom}"; fi')
         l.append(f'echo "  {nom} ({ref}) : $(git -C {dest} rev-parse --short HEAD)"')
     return "\n".join(l) + "\n"
 
@@ -385,6 +387,8 @@ def cmd_verifier(hote, a):
     script = ('export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" GIT_TERMINAL_PROMPT=0\n'
               'echo "git      : $(git --version 2>&1 | head -n 1)"\n'
               'echo "python3  : $(python3 --version 2>&1)"\n'
+              'if git lfs version >/dev/null 2>&1; then echo "git-lfs  : présent"; '
+              'else echo "git-lfs  : absent (nécessaire seulement si des dépôts utilisent Git LFS)"; fi\n'
               'if command -v oarsub >/dev/null; then echo "oarsub   : présent"; '
               'else echo "oarsub   : ABSENT (normal en mode essai local)"; fi\n')
     script += ('c=$(command -v conda || true)\n'
