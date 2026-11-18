@@ -22,6 +22,7 @@ Commandes :
     python3 lancer_entretiens.py lancer --entretien BOC.066 --video-sujet V_S.wmv \\
         --video-psy V_P.wmv --fix-sujet F_S.txt --fix-psy F_P.txt [--attendre]
     python3 lancer_entretiens.py statut
+    python3 lancer_entretiens.py attendre [ENTRETIEN ...] [--sortie DOSSIER]   (reprendre l'attente)
     python3 lancer_entretiens.py recuperer [ENTRETIEN ...] [--sortie DOSSIER] [--avec-logs]
     python3 lancer_entretiens.py journal ENTRETIEN [--unite segmentation_sujet] [--lignes 40]
     python3 lancer_entretiens.py arbre [--profondeur 3]
@@ -56,6 +57,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:                      # barres de progression (facultatif : pip install tqdm)
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ==============================================================================
 # CONFIGURATION - valeurs par défaut. Vos réglages personnels vont dans lanceur.ini (à côté de
 # ce fichier, modèle : lanceur_exemple.ini) : ils remplacent ceux-ci et survivent aux mises à jour.
@@ -89,7 +95,8 @@ DEPOT_ORCHESTRATION = "orchestration"   # dépôt qui contient les deux fichiers
 FICHIER_ORCHESTRATEUR = "orchestrateur.py"
 FICHIER_CONFIG = "config.ini"
 
-INTERVALLE_ATTENTE_MIN = 10   # --attendre : fréquence de vérification
+INTERVALLE_ATTENTE_S = 60     # --attendre : fréquence de vérification (secondes)
+EMPECHER_VEILLE = True        # bloque la mise en veille de VOTRE machine pendant lancer / attendre / recuperer
 RELANCES_AUTO = 1             # --attendre : relances d'un entretien interrompu (fin des 12 h)
 # ==============================================================================
 
@@ -127,7 +134,7 @@ def charger_reglages():
               "dossier_resultats": "DOSSIER_RESULTATS", "dossier_entrees_distant": "DOSSIER_ENTREES_DISTANT",
               "dossier_lots_distant": "DOSSIER_LOTS_DISTANT", "depot_orchestration": "DEPOT_ORCHESTRATION",
               "fichier_orchestrateur": "FICHIER_ORCHESTRATEUR", "fichier_config": "FICHIER_CONFIG"}
-    entiers = {"intervalle_attente_min": "INTERVALLE_ATTENTE_MIN", "relances_auto": "RELANCES_AUTO"}
+    entiers = {"intervalle_attente_s": "INTERVALLE_ATTENTE_S", "relances_auto": "RELANCES_AUTO"}
     if cp.has_section("lanceur"):
         for cle, val in cp["lanceur"].items():
             val = val.strip()
@@ -135,6 +142,10 @@ def charger_reglages():
                 g[textes[cle]] = (val or None) if cle == "ssh_hote" else val
             elif cle in entiers:
                 g[entiers[cle]] = int(val)
+            elif cle == "empecher_veille":
+                g["EMPECHER_VEILLE"] = val.lower() in ("1", "oui", "true", "vrai", "yes")
+            elif cle == "intervalle_attente_min":      # ancien nom du réglage
+                g["INTERVALLE_ATTENTE_S"] = int(val) * 60
             else:
                 sys.exit(f"{chemin.name} : réglage inconnu '{cle}'")
     if cp.has_section("depots"):
@@ -161,6 +172,46 @@ CLES = ["video_sujet", "video_psy", "fix_sujet", "fix_psy"]
 q = shlex.quote
 
 
+class EmpecherVeille:
+    """Empêche la mise en veille automatique de votre machine tant que le programme tourne
+    (Linux : systemd-inhibit ; macOS : caffeinate). Sans effet si l'outil n'existe pas.
+    Attention : fermer le capot d'un portable peut tout de même le mettre en veille."""
+
+    def __init__(self, actif=True):
+        self.actif, self.proc = actif, None
+
+    def __enter__(self):
+        if not self.actif:
+            return self
+        if shutil.which("systemd-inhibit"):
+            cmd = ["systemd-inhibit", "--what=idle:sleep", "--who=lancer_entretiens",
+                   "--why=Attente des resultats Grid5000", "--mode=block", "sleep", "infinity"]
+        elif shutil.which("caffeinate"):
+            cmd = ["caffeinate", "-i", "-s"]
+        else:
+            return self
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+            time.sleep(0.3)
+            if self.proc.poll() is not None:      # refusé (pas de systemd, droits...)
+                self.proc = None
+            else:
+                print("(mise en veille de cette machine bloquée pendant l'exécution)")
+        except OSError:
+            self.proc = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        return False
+
+
 def nettoyer(nom):
     return re.sub(r"[^\w.\-]+", "_", nom).strip("_") or "x"
 
@@ -185,11 +236,25 @@ class Hote:
             self.ssh += ["-J", f"{G5K_LOGIN}@access.grid5000.fr"]
             self.cible = f"{G5K_LOGIN}@{G5K_SITE}.grid5000.fr"
 
-    def executer(self, script, capture=False, check=True):
+    def reinitialiser_connexion(self):
+        """Ferme la connexion SSH partagée (devenue inutilisable après une mise en veille)."""
+        if self.local:
+            return
+        try:
+            subprocess.run(self.ssh + ["-O", "exit", self.cible], capture_output=True, timeout=15)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    def executer(self, script, capture=False, check=True, timeout=None):
         cmd = ["bash", "-s"] if self.local else self.ssh + [self.cible, "bash -s"]
-        r = subprocess.run(cmd, input="set -euo pipefail\n" + script, text=True,
-                           capture_output=capture)
+        try:
+            r = subprocess.run(cmd, input="set -euo pipefail\n" + script, text=True,
+                               capture_output=capture, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.reinitialiser_connexion()
+            sys.exit(f"Délai dépassé ({timeout} s) : connexion probablement coupée (mise en veille ?).")
         if check and r.returncode == 255 and not self.local:
+            self.reinitialiser_connexion()
             test = " ".join(q(x) for x in self.ssh + [self.cible, "hostname"])
             sys.exit("Connexion SSH à Grid'5000 impossible (code 255).\n"
                      f"Testez à la main :  {test}\n"
@@ -330,7 +395,7 @@ def script_clonage(lot, depots):
             l.append(f"git clone --quiet {q(url)} {dest} && git -C {dest} checkout --quiet {q(ref)}")
         else:
             l.append(f"git clone --quiet --depth 1 --branch {q(ref)} {q(url)} {dest}")
-        l.append(f'if git lfs version >/dev/null 2>&1; then git -C {dest} lfs pull --quiet || '
+        l.append(f'if git lfs version >/dev/null 2>&1; then git -C {dest} lfs pull >/dev/null 2>&1 || '
                  f'echo "  ATTENTION : git lfs pull a echoue pour {nom}"; fi')
         l.append(f'echo "  {nom} ({ref}) : $(git -C {dest} rev-parse --short HEAD)"')
     return "\n".join(l) + "\n"
@@ -340,7 +405,7 @@ def statut_json(hote, home):
     lots = dev(DOSSIER_LOTS_DISTANT, home)
     script = (SCRIPT_DERNIER_LOT.format(lots=lots)
               + commande_orchestrateur("statut", '"$lot"', "--json"))
-    sortie = hote.executer(script, capture=True).stdout.strip().splitlines()
+    sortie = hote.executer(script, capture=True, timeout=120).stdout.strip().splitlines()
     for ligne in reversed(sortie):
         if ligne.startswith("["):
             return json.loads(ligne)
@@ -481,42 +546,94 @@ def cmd_lancer(hote, a):
               f"Résultats : python3 {Path(__file__).name} recuperer --sortie {dest_local}")
         return
 
-    print(f"== 4/4  Attente des résultats (vérification toutes les {INTERVALLE_ATTENTE_MIN} min ; "
+    print(f"== 4/4  Attente des résultats (vérification toutes les {INTERVALLE_ATTENTE_S} s ; "
           f"Ctrl+C pour arrêter, les jobs continuent sur Grid'5000)")
     attendre(hote, home, noms, dest_local)
 
 
+def _fraction(e):
+    p = e.get("progression")
+    return (p["n"] / p["total"]) if p and p.get("total") else 0.0
+
+
+def _texte_progression(e):
+    """Ex. : 'segmentation:sujet | Detecting landmarks 45% (26000/57890) [32:10<39:11, 13.10it/s]'."""
+    if e["statut"] == "en_cours" and e.get("unite_en_cours"):
+        p = e.get("progression")
+        txt = e["unite_en_cours"]
+        if p:
+            txt += f" | {p['desc'] or 'progression'} {p['pct']}% ({p['n']}/{p['total']}) [{p['info']}]"
+        return txt
+    return e["statut"] + (f" ({e['erreur']})" if e.get("erreur") else "")
+
+
 def attendre(hote, home, noms, dest_local):
     termines, abandonnes, relances = set(), set(), {n: 0 for n in noms}
+    barres, derniers = {}, {}
+    ecrire = tqdm.write if tqdm else print
     while len(termines) + len(abandonnes) < len(noms):
+        coupure = False
         try:
             statuts = {e["entretien"]: e for e in statut_json(hote, home)}
-            for n in noms:
-                if n in termines or n in abandonnes or n not in statuts:
+            for i, n in enumerate(noms):
+                if n not in statuts:
                     continue
                 e = statuts[n]
+                total = e["unites_total"]
+                avancement = min(e["unites_terminees"] + (_fraction(e) if e["statut"] == "en_cours" else 0), total)
+                texte = _texte_progression(e)
+                if tqdm:
+                    if n not in barres:
+                        barres[n] = tqdm(total=total, desc=n, position=i, unit="étape", dynamic_ncols=True,
+                                         bar_format="{desc} {percentage:3.0f}%|{bar}| {n:.2f}/{total} étapes "
+                                                    "[{elapsed}] {postfix}")
+                    barres[n].n = avancement
+                    barres[n].set_postfix_str(texte, refresh=True)
+                elif derniers.get(n) != texte:
+                    derniers[n] = texte
+                    print(f"  [{time.strftime('%H:%M')}] {n} : {e['unites_terminees']}/{total} étapes | {texte}")
+
+                if n in termines or n in abandonnes:
+                    continue
                 if e["statut"] == "termine":
                     recuperer(hote, [e], [n], dest_local)
                     termines.add(n)
                 elif e["statut"] == "interrompu" and relances[n] < RELANCES_AUTO:
                     relances[n] += 1
-                    print(f"  {n} : interrompu (temps écoulé) -> relance automatique {relances[n]}/{RELANCES_AUTO}")
+                    ecrire(f"  {n} : interrompu (temps écoulé) -> relance automatique {relances[n]}/{RELANCES_AUTO}")
                     lots = dev(DOSSIER_LOTS_DISTANT, home)
                     hote.executer(SCRIPT_DERNIER_LOT.format(lots=lots)
                                   + commande_orchestrateur("relancer", '"$lot"', q(n)))
                 elif e["statut"] in ("echec", "interrompu"):
-                    print(f"  {n} : {e['statut']} - {e['erreur']}")
+                    ecrire(f"  {n} : {e['statut']} - {e['erreur']}")
                     fin_du_journal(hote, e)
-                    print(f"  (journal complet : python3 {Path(__file__).name} recuperer {n} --avec-logs)")
+                    ecrire(f"  (journal complet : python3 {Path(__file__).name} recuperer {n} --avec-logs)")
                     abandonnes.add(n)
-            restants = [n for n in noms if n not in termines and n not in abandonnes]
-            if restants:
-                print(f"  [{time.strftime('%H:%M')}] en cours : {', '.join(restants)}")
         except (SystemExit, subprocess.CalledProcessError, OSError) as exc:
-            print(f"  (connexion perdue, nouvel essai plus tard : {exc})")
+            ecrire(f"  (connexion perdue, nouvel essai dans 30 s : {exc})")
+            coupure = True
+            if hote is not None:
+                hote.reinitialiser_connexion()
         if len(termines) + len(abandonnes) < len(noms):
-            time.sleep(INTERVALLE_ATTENTE_MIN * 60)
+            time.sleep(30 if coupure else INTERVALLE_ATTENTE_S)
+    for b in barres.values():
+        b.close()
     print(f"\nTerminé : {len(termines)} entretien(s) récupéré(s), {len(abandonnes)} en échec.")
+
+
+def cmd_attendre(hote, a):
+    """Reprend l'attente (et la récupération au fil de l'eau) d'entretiens déjà soumis."""
+    home = hote.home()
+    dest = Path(os.path.expanduser(a.sortie or DOSSIER_RESULTATS))
+    noms = [e["entretien"] for e in statut_json(hote, home)
+            if (not a.entretiens or e["entretien"] in a.entretiens)
+            and (e["statut"] in ("soumis", "en_cours", "interrompu")
+                 or (e["statut"] == "termine" and not (dest / e["entretien"]).exists()))]
+    if not noms:
+        print("Rien à attendre : tous les entretiens sont terminés et récupérés (ou en échec).")
+        return
+    print(f"Attente de : {', '.join(noms)}  (Ctrl+C pour arrêter ; les jobs continuent sur Grid'5000)")
+    attendre(hote, home, noms, dest)
 
 
 def cmd_statut(hote, a):
@@ -528,6 +645,8 @@ def cmd_statut(hote, a):
         print(f"{e['entretien']:<20} {e['statut']:<11} étapes {e['unites_terminees']}/{e['unites_total']}"
               f"  essais={e['tentatives']}  jobs={','.join(map(str, e['job_ids'])) or '-'}"
               f"  {e['erreur']}".rstrip())
+        if e["statut"] == "en_cours":
+            print(f"{'':<20} -> {_texte_progression(e)}")
 
 
 def cmd_recuperer(hote, a):
@@ -602,6 +721,10 @@ def main():
     s.add_argument("--attendre", action="store_true", help="Attendre et récupérer les résultats au fil de l'eau")
     s.add_argument("--simuler", action="store_true", help="Afficher les oarsub sans soumettre")
     s.add_argument("--forcer", action="store_true", help="Refaire même si déjà terminé")
+    s = sp.add_parser("attendre", help="Reprendre l'attente d'entretiens déjà soumis (récupère les résultats)")
+    commun(s)
+    s.add_argument("entretiens", nargs="*")
+    s.add_argument("--sortie", help="Dossier local des résultats (défaut : DOSSIER_RESULTATS)")
     s = sp.add_parser("statut", help="Avancement des entretiens")
     commun(s)
     s = sp.add_parser("recuperer", help="Télécharger les résultats des entretiens terminés")
@@ -628,10 +751,11 @@ def main():
     a = p.parse_args()
     charger_reglages()
     hote = Hote(a.hote or SSH_HOTE)
-    {"verifier": cmd_verifier, "lancer": cmd_lancer, "statut": cmd_statut,
-     "recuperer": cmd_recuperer, "relancer": cmd_relancer,
-     "journal": cmd_journal, "arbre": cmd_arbre,
-     "televerser": cmd_televerser}[a.cmd](hote, a)
+    with EmpecherVeille(EMPECHER_VEILLE and a.cmd in ("lancer", "attendre", "recuperer")):
+        {"verifier": cmd_verifier, "lancer": cmd_lancer, "statut": cmd_statut, "attendre": cmd_attendre,
+         "recuperer": cmd_recuperer, "relancer": cmd_relancer,
+         "journal": cmd_journal, "arbre": cmd_arbre,
+         "televerser": cmd_televerser}[a.cmd](hote, a)
 
 
 if __name__ == "__main__":

@@ -339,9 +339,9 @@ def detecter_paquets(dossiers):
         for p in base.rglob("*.py"):
             if DOSSIERS_IGNORES & set(p.relative_to(base).parts):
                 continue
-            locaux.add(p.stem)
+            locaux.add(p.stem.lower())
             if p.name == "__init__.py":
-                locaux.add(p.parent.name)
+                locaux.add(p.parent.name.lower())
             try:
                 arbre = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
             except SyntaxError:
@@ -351,8 +351,12 @@ def detecter_paquets(dossiers):
                     importes.update(a.name.split(".")[0] for a in n.names)
                 elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
                     importes.add(n.module.split(".")[0])
-    externes = {m for m in importes if m not in stdlib and m not in locaux and m != "__future__"}
-    return sorted({MODULE_VERS_PAQUET.get(m, m) for m in externes}, key=str.lower), sorted(importes & locaux)
+        for d in base.rglob("*"):                       # dossiers (paquets locaux sans __init__.py)
+            if d.is_dir() and not (DOSSIERS_IGNORES & set(d.relative_to(base).parts)):
+                locaux.add(d.name.lower())
+    externes = {m for m in importes if m not in stdlib and m.lower() not in locaux and m != "__future__"}
+    return (sorted({MODULE_VERS_PAQUET.get(m, m) for m in externes}, key=str.lower),
+            sorted(m for m in importes if m.lower() in locaux))
 
 
 def _nom_paquet(spec):
@@ -365,13 +369,13 @@ def paquets_a_installer(e):
     (ex. opencv-python<5) l'emporte sur la détection du même package."""
     jetons = shlex.split(e["paquets"])
     if "auto" not in jetons:
-        return jetons
+        return jetons, []
     if not e["sources"]:
         raise ValueError("paquets = auto demande aussi sources = <dossier à analyser>")
     detectes, _ = detecter_paquets(shlex.split(e["sources"]))
     explicites = [j for j in jetons if j != "auto"]
     noms = {_nom_paquet(j) for j in explicites}
-    return explicites + [d for d in detectes if _nom_paquet(d) not in noms]
+    return explicites, [d for d in detectes if _nom_paquet(d) not in noms]
 
 
 def script_creation_env(cfg, etape):
@@ -404,10 +408,23 @@ def script_creation_env(cfg, etape):
     if e["requirements"]:
         l.append("python -m pip install -r " + shlex.quote(e["requirements"]))
     if e["paquets"]:
-        liste = paquets_a_installer(e)
-        l.append('echo "packages à installer : ' + " ".join(liste).replace('"', "") + '"')
-        if liste:
-            l.append("python -m pip install " + " ".join(shlex.quote(x) for x in liste))
+        explicites, detectes = paquets_a_installer(e)
+        tous = explicites + detectes
+        l.append('echo "packages à installer : ' + " ".join(tous).replace('"', "") + '"')
+        qs = lambda xs: " ".join(shlex.quote(x) for x in xs)
+        if detectes:
+            # Un nom déduit des import peut ne pas être sur PyPI (module local absent du dépôt) :
+            # on réessaie paquet par paquet ; seuls les paquets explicites doivent réussir.
+            repli = ['echo "Installation groupée échouée : essai paquet par paquet"']
+            if explicites:
+                repli.append("python -m pip install " + qs(explicites))
+            for d in detectes:
+                nom = re.sub(r"[^\w.\-]", "", d)
+                repli.append(f'python -m pip install {shlex.quote(d)} || '
+                             f'echo "ATTENTION : {nom} non installé (module local absent du dépôt ?)"')
+            l.append("python -m pip install " + qs(tous) + " || {\n" + "\n".join(repli) + "\n}")
+        elif explicites:
+            l.append("python -m pip install " + qs(explicites))
     l += [f'touch "$env/{ENV_PRET}"', 'echo "environnement prêt : $env"']
     return "\n".join(l) + "\n"
 
@@ -796,13 +813,39 @@ def verifier_entrees(liste):
 # ------------------------------------------------------------------------------
 # Statut
 # ------------------------------------------------------------------------------
+# Dernière barre tqdm écrite dans le journal d'une étape (ex. "Detecting landmarks:  45%|████| 26000/57890 [32:10<39:11, 13.10it/s]")
+RE_TQDM = re.compile(r"(?:(?P<desc>[A-Za-z][^\r\n|%]*?):\s*)?(?P<pct>\d{1,3})%\|[^|\r\n]*\|\s*(?P<n>\d+)/(?P<total>\d+)\s*\[(?P<info>[^\]\r\n]*)\]")
+
+
+def progression_unite(racine, cle):
+    """Progression de l'étape en cours, lue dans la fin de son journal (None si introuvable)."""
+    journal = racine / "logs" / f"{cle.replace(':', '_')}.log"
+    try:
+        with open(journal, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 16384))
+            fin = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for morceau in reversed(re.split(r"[\r\n]+", fin)):
+        m = RE_TQDM.search(morceau)
+        if m:
+            return {"desc": (m.group("desc") or "").strip(), "pct": int(m.group("pct")),
+                    "n": int(m.group("n")), "total": int(m.group("total")), "info": m.group("info")}
+    return None
+
+
 def afficher_statut(cfg, en_json=False):
     total = len(liste_unites(cfg))
     if en_json:
         sortie = []
         for p in sorted(cfg.racine_travail.glob("*/etat.json")):
             e = json.loads(p.read_text(encoding="utf-8"))
+            en_cours = next((k for k, u in e["unites"].items() if u.get("statut") == "en_cours"), None) \
+                if e["statut"] == "en_cours" else None
             sortie.append({
+                "unite_en_cours": en_cours,
+                "progression": progression_unite(p.parent, en_cours) if en_cours else None,
                 "entretien": e["entretien"], "statut": e["statut"],
                 "unites_terminees": sum(1 for u in e["unites"].values()
                                         if u.get("statut") == "termine"),
