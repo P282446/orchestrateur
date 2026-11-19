@@ -127,6 +127,7 @@ class Config:
                    "requirements": s.get("requirements", "").strip().replace("{pipelines}", str(self.pipelines)),
                    "paquets": s.get("paquets", "").strip(),
                    "sources": s.get("sources", "").strip().replace("{pipelines}", str(self.pipelines)),
+                   "exclure": s.get("exclure", "").strip(),
                    "version_python": s.get("version_python", "").strip(),
                    "python_exe": s.get("python_exe", self.python).strip()}
             self.etapes[e] = {"commandes": cmds, "portee": portee,
@@ -375,7 +376,8 @@ def paquets_a_installer(e):
     detectes, _ = detecter_paquets(shlex.split(e["sources"]))
     explicites = [j for j in jetons if j != "auto"]
     noms = {_nom_paquet(j) for j in explicites}
-    return explicites, [d for d in detectes if _nom_paquet(d) not in noms]
+    exclus = {_nom_paquet(x) for x in shlex.split(e.get("exclure", ""))}
+    return explicites, [d for d in detectes if _nom_paquet(d) not in noms and _nom_paquet(d) not in exclus]
 
 
 def script_creation_env(cfg, etape):
@@ -413,15 +415,13 @@ def script_creation_env(cfg, etape):
         l.append('echo "packages à installer : ' + " ".join(tous).replace('"', "") + '"')
         qs = lambda xs: " ".join(shlex.quote(x) for x in xs)
         if detectes:
-            # Un nom déduit des import peut ne pas être sur PyPI (module local absent du dépôt) :
-            # on réessaie paquet par paquet ; seuls les paquets explicites doivent réussir.
-            repli = ['echo "Installation groupée échouée : essai paquet par paquet"']
-            if explicites:
-                repli.append("python -m pip install " + qs(explicites))
-            for d in detectes:
-                nom = re.sub(r"[^\w.\-]", "", d)
-                repli.append(f'python -m pip install {shlex.quote(d)} || '
-                             f'echo "ATTENTION : {nom} non installé (module local absent du dépôt ?)"')
+            # Installation groupée ; en cas d'échec, essai paquet par paquet pour NOMMER ce qui échoue.
+            # Un paquet manquant arrête l'étape (sinon l'erreur n'apparaîtrait qu'à l'exécution).
+            repli = ['echo "Installation groupée échouée : essai paquet par paquet"', 'manquants=""']
+            for x in tous:
+                repli.append(f'python -m pip install {shlex.quote(x)} || manquants="$manquants {re.sub(r"[^A-Za-z0-9_.<>=!~,-]", "", x)}"')
+            repli.append('if [ -n "$manquants" ]; then echo "ERREUR : packages non installés :$manquants '
+                         '(version de Python incompatible ? module du dépôt à exclure avec exclure = ... ?)"; exit 1; fi')
             l.append("python -m pip install " + qs(tous) + " || {\n" + "\n".join(repli) + "\n}")
         elif explicites:
             l.append("python -m pip install " + qs(explicites))
