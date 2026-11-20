@@ -1,0 +1,1 @@
+python3 lancer_entretiens.py lancer --manifeste entretiens.csv --attendre --sortie ~/Bureau/resultats
